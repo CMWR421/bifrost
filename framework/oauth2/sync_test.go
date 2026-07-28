@@ -127,7 +127,6 @@ func seedFixtures(t *testing.T, store *testConfigStore, tokenURL string) (oauthC
 		Scopes:      `["read"]`,
 		Status:      "authorized",
 		TokenID:     new(tokenID),
-		ExpiresAt:   time.Now().Add(24 * time.Hour),
 	}
 
 	return oauthConfigID
