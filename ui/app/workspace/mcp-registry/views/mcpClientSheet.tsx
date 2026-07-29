@@ -43,6 +43,7 @@ import { mcpClientUpdateSchema, type MCPClientUpdateSchema } from "@/lib/types/s
 import { parseArrayFromText } from "@/lib/utils/array";
 import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
 import { zodResolver } from "@hookform/resolvers/zod";
+import { Link } from "@tanstack/react-router";
 import { ChevronDown, ChevronRight, Info, Plus, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
@@ -98,6 +99,10 @@ export default function MCPClientSheet({
 	hasNext = false,
 }: MCPClientSheetProps) {
 	const hasUpdateMCPClientAccess = useRbac(RbacResource.MCPGateway, RbacOperation.Update);
+	// Per-user auth types (OAuth + headers) don't hold a shared upstream
+	// connection, so the connection-state badge is misleading for them: see
+	// the state badge below.
+	const isPerUserAuth = mcpClient.config.auth_type === "per_user_oauth" || mcpClient.config.auth_type === "per_user_headers";
 	const [updateMCPClient, { isLoading: isUpdating }] = useUpdateMCPClientMutation();
 	const [initiateVerification, { isLoading: isInitiatingVerification }] = useInitiateMCPClientVerificationMutation();
 	const [verifyMCPClientHeaders] = useVerifyMCPClientHeadersMutation();
@@ -498,7 +503,21 @@ export default function MCPClientSheet({
 							<div className="space-y-2">
 								<SheetTitle className="flex w-fit items-center gap-2 font-medium">
 									{mcpClient.config.name}
-									<Badge className={MCP_STATUS_COLORS[mcpClient.state]}>{mcpClient.state}</Badge>
+									{isPerUserAuth ? (
+										// Per-user clients never hold a shared upstream connection, so a
+										// connection-state badge here would be misleading: point to the
+										// per-user sessions this client actually has instead.
+										<Link
+											to="/workspace/mcp-sessions"
+											search={{ mcp_client_id: [mcpClient.config.client_id] }}
+											className="text-primary text-xs font-medium hover:underline"
+											data-testid="mcp-client-view-sessions-link"
+										>
+											View sessions
+										</Link>
+									) : (
+										<Badge className={MCP_STATUS_COLORS[mcpClient.state]}>{mcpClient.state}</Badge>
+									)}
 									{mcpClient.state === "pending_verification" && hasUpdateMCPClientAccess && (
 										<Button
 											type="button"
@@ -521,7 +540,9 @@ export default function MCPClientSheet({
 										? mcpClient.config.auth_type === "per_user_oauth"
 											? "This client was declared in config.json. A one-time admin test login is needed to verify the OAuth setup and discover tools — each user will authenticate individually afterward."
 											: "This client was declared in config.json and needs a one-time OAuth authorization before it can be used."
-										: "MCP server configuration and available tools"}
+										: mcpClient.state === "needs_reauth"
+											? "This connection's credentials have expired and need to be re-authorized. Re-authorization from the dashboard isn't available yet: recreating this client is the current workaround."
+											: "MCP server configuration and available tools"}
 								</SheetDescription>
 							</div>
 							<SheetNavigationButtons
