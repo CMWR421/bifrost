@@ -22,6 +22,7 @@ import (
 	"github.com/maximhq/bifrost/framework/configstore"
 	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/temptoken"
+	"golang.org/x/sync/singleflight"
 	"gorm.io/gorm"
 )
 
@@ -37,6 +38,16 @@ type OAuth2Provider struct {
 	mu             sync.RWMutex
 	retryBaseDelay time.Duration // base delay for token endpoint retry backoff; doubles each attempt (1×, 2×, 4×)
 
+	// refreshGroup serializes RefreshAccessToken per token ID instead of
+	// provider-wide: exchangeRefreshToken can make up to maxTokenRetries
+	// network attempts at networkTimeout each, and one slow identity
+	// provider's refresh must not stall every other token's refresh on this
+	// provider. Concurrent refreshes of the *same* token still collapse into
+	// a single call and share its result, which is what actually needs to
+	// be prevented (a racing double refresh_token redemption, most upstreams
+	// reject the second as replay).
+	refreshGroup singleflight.Group
+
 	// tempTokens, when non-nil and enabled in client config, is used by
 	// InitiateUserOAuthFlow to mint a short-lived mcp_auth temp token and
 	// embed it in the returned auth-page URL as a fragment. Optional — when
@@ -45,8 +56,8 @@ type OAuth2Provider struct {
 	//
 	// Held as an atomic.Pointer rather than under p.mu: it is written once at
 	// startup and read on the request path, and p.mu is write-locked across
-	// token-refresh network I/O (RefreshAccessToken/RevokeToken). Sharing p.mu
-	// would stall flow init/cleanup reads behind unrelated refresh traffic.
+	// RevokeToken's database I/O. Sharing p.mu would stall flow init/cleanup
+	// reads behind unrelated revoke traffic.
 	tempTokens atomic.Pointer[temptoken.Service]
 }
 
@@ -98,7 +109,7 @@ func (p *OAuth2Provider) mcpTempTokenAuthEnabled(ctx context.Context) bool {
 // Detached from the caller's context via WithoutCancel so a client cancellation
 // (e.g. the browser closing the tab after the upstream OAuth bounce) can't
 // short-circuit the deletes and leave the rows alive until the sweep. Mirrors
-// the pattern used by markExpiredIfPermanent in this file.
+// the pattern used by RefreshAccessToken's terminal status flip in this file.
 func (p *OAuth2Provider) cleanupFlow(ctx context.Context, sessionID string) {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
@@ -123,34 +134,33 @@ func (p *OAuth2Provider) GetAccessToken(ctx context.Context, oauthConfigID strin
 		return "", schemas.ErrOAuth2ConfigNotFound
 	}
 
-	// Check if OAuth is authorized
-	if oauthConfig.Status != "authorized" {
-		return "", fmt.Errorf("oauth not authorized yet, status: %s", oauthConfig.Status)
-	}
-
-	// Check if token is linked
-	if oauthConfig.TokenID == nil {
-		return "", fmt.Errorf("no token linked to oauth config")
-	}
-
-	// Load oauth_token by TokenID
-	token, err := p.configStore.GetOauthTokenByID(ctx, *oauthConfig.TokenID)
+	// Resolve the shared token row via (oauth_config_id, auth_mode='shared')
+	// — the replacement for the retired TableOauthConfig.TokenID FK shortcut.
+	token, err := p.configStore.GetSharedOauthTokenByConfigID(ctx, oauthConfigID)
 	if err != nil {
 		return "", fmt.Errorf("failed to load oauth token: %w", err)
 	}
 	if token == nil {
-		return "", fmt.Errorf("oauth token not found")
+		return "", fmt.Errorf("no token linked to oauth config")
+	}
+
+	// The token's own Status ('active' | 'orphaned' | 'needs_reauth') is the
+	// sole source of truth for whether this credential is usable.
+	// oauthConfig.Status only tracks the one-time bootstrap lifecycle
+	// (pending/authorized/failed) and is never consulted here — matching how
+	// GetUserAccessTokenByMode has always worked.
+	if token.Status != "active" {
+		return "", fmt.Errorf("oauth token is not active, status: %s: %w", token.Status, schemas.ErrOAuth2TokenExpired)
 	}
 
 	// Refresh only when the token has known expiry and a refresh token is available.
 	if token.ExpiresAt != nil && time.Now().After(*token.ExpiresAt) && strings.TrimSpace(token.RefreshToken) != "" {
 		// Attempt automatic refresh
-		if err := p.RefreshAccessToken(ctx, oauthConfigID); err != nil {
-			p.markExpiredIfPermanent(ctx, oauthConfig, err)
+		if err := p.RefreshAccessToken(ctx, token.ID); err != nil {
 			return "", fmt.Errorf("token expired and refresh failed: %w", err)
 		}
 		// Reload token after refresh
-		token, err = p.configStore.GetOauthTokenByID(ctx, *oauthConfig.TokenID)
+		token, err = p.configStore.GetOauthTokenByID(ctx, token.ID)
 		if err != nil || token == nil {
 			return "", fmt.Errorf("failed to reload token after refresh: %w", err)
 		}
@@ -167,41 +177,89 @@ func (p *OAuth2Provider) GetAccessToken(ctx context.Context, oauthConfigID strin
 	return accessToken, nil
 }
 
-// RefreshAccessToken refreshes the access token for a given oauth_config_id
-func (p *OAuth2Provider) RefreshAccessToken(ctx context.Context, oauthConfigID string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+// RefreshAccessToken refreshes any MCP OAuth token row — the single shared
+// client credential (AuthMode="shared") or a per-identity credential
+// (AuthMode "user"/"vk"/"session") alike — looked up by the token row's own
+// primary-key ID. This is the one refresh path for every kind of MCP OAuth
+// credential: GetAccessToken and GetUserAccessTokenByMode both funnel their
+// lazy pre-flight refresh through here, unifying what used to be two
+// separate functions (one keyed by oauth_config_id and reachable only via
+// TableOauthConfig.TokenID, one keyed by token ID directly).
+//
+// Never writes to TableOauthConfig: the template config row (client_id,
+// token_url, etc.) is read-only input to the token exchange here. Credential
+// health lives entirely on the token row's own Status field.
+func (p *OAuth2Provider) RefreshAccessToken(ctx context.Context, tokenID string) error {
+	_, err, _ := p.refreshGroup.Do(tokenID, func() (any, error) {
+		return nil, p.refreshAccessTokenLocked(ctx, tokenID)
+	})
+	return err
+}
 
-	// Load oauth_config
-	oauthConfig, err := p.configStore.GetOauthConfigByID(ctx, oauthConfigID)
-	if err != nil || oauthConfig == nil {
-		return fmt.Errorf("oauth config not found: %w", err)
+// refreshAccessTokenLocked is RefreshAccessToken's body, run inside
+// p.refreshGroup.Do so concurrent refreshes of the same token ID collapse
+// into one call instead of each redeeming the refresh token independently.
+func (p *OAuth2Provider) refreshAccessTokenLocked(ctx context.Context, tokenID string) error {
+	token, err := p.configStore.GetOauthTokenByID(ctx, tokenID)
+	if err != nil {
+		return fmt.Errorf("failed to load oauth token: %w", err)
 	}
-
-	if oauthConfig.TokenID == nil {
-		return fmt.Errorf("no token linked to oauth config")
-	}
-
-	// Load oauth_token
-	token, err := p.configStore.GetOauthTokenByID(ctx, *oauthConfig.TokenID)
-	if err != nil || token == nil {
-		return fmt.Errorf("oauth token not found: %w", err)
+	if token == nil {
+		return fmt.Errorf("oauth token not found: %s", tokenID)
 	}
 
 	if strings.TrimSpace(token.RefreshToken) == "" {
 		return fmt.Errorf("no refresh token available")
 	}
 
+	// Load template OAuth config for token_url, client_id, etc. Split nil
+	// from a real lookup failure so a missing config doesn't surface as a
+	// useless "%!w(<nil>)" wrapped error.
+	templateConfig, err := p.configStore.GetOauthConfigByID(ctx, token.OauthConfigID)
+	if err != nil {
+		return fmt.Errorf("failed to load template oauth config for refresh: %w", err)
+	}
+	if templateConfig == nil {
+		return schemas.ErrOAuth2ConfigNotFound
+	}
+
 	// Call OAuth provider's token endpoint with refresh_token
 	newTokenResponse, err := p.exchangeRefreshToken(
 		ctx,
-		oauthConfig.TokenURL,
-		oauthConfig.GetResolvedClientID(),
-		oauthConfig.GetResolvedClientSecret(),
+		templateConfig.TokenURL,
+		templateConfig.GetResolvedClientID(),
+		templateConfig.GetResolvedClientSecret(),
 		token.RefreshToken,
-		strings.TrimSpace(oauthConfig.Resource),
+		strings.TrimSpace(templateConfig.Resource),
 	)
 	if err != nil {
+		// Permanent rejection (HTTP 401, or 400 with invalid_grant /
+		// unauthorized_client per RFC 6749 §5.2) means the refresh token is
+		// dead — revoked, expired, or bound to a grant the AS no longer
+		// honors. Flip the row to 'needs_reauth' and signal
+		// re-authentication via the ErrOAuth2TokenExpired sentinel,
+		// regardless of which kind of holder (shared client or per-identity)
+		// this row belongs to. Keeping the row (rather than deleting)
+		// preserves binding identity + audit history; a fresh OAuth
+		// completion (reauthorize for shared, re-auth flow for per-identity)
+		// updates the same row back to 'active'.
+		if permErr, ok := errors.AsType[*PermanentOAuthError](err); ok {
+			// Use context.Background for the terminal status flip — the
+			// caller's ctx may already be canceled (request abort, upstream
+			// timeout) by the time we get the 'invalid_grant' / 401, and if
+			// the UPDATE fails because of that, the row stays 'active' and
+			// every subsequent call keeps retrying a dead refresh token
+			// instead of surfacing the re-auth requirement.
+			if markErr := p.configStore.MarkOauthUserTokenNeedsReauthByID(context.Background(), token.ID); markErr != nil {
+				return fmt.Errorf("oauth refresh permanently rejected but status update failed (mcp_client=%s auth_mode=%s upstream_status=%d): %w",
+					token.MCPClientID, token.AuthMode, permErr.StatusCode, markErr)
+			}
+			logger.Debug("OAuth refresh permanently rejected; token marked needs_reauth: mcp_client=%s auth_mode=%s upstream_status=%d",
+				token.MCPClientID, token.AuthMode, permErr.StatusCode)
+			return fmt.Errorf("refresh token rejected by upstream OAuth server, re-authentication required: %w", schemas.ErrOAuth2TokenExpired)
+		}
+		// Transient failure (5xx, network blip, non-permanent 400) — keep the
+		// row so the next call retries refresh.
 		return fmt.Errorf("token refresh failed: %w", err)
 	}
 	// Update token in database (sanitize tokens to prevent header formatting issues)
@@ -221,7 +279,7 @@ func (p *OAuth2Provider) RefreshAccessToken(ctx context.Context, oauthConfigID s
 		return fmt.Errorf("failed to update token: %w", err)
 	}
 
-	logger.Debug("OAuth token refreshed successfully oauth_config_id : %s", oauthConfigID)
+	logger.Debug("OAuth token refreshed successfully: token_id=%s auth_mode=%s", token.ID, token.AuthMode)
 
 	return nil
 }
@@ -233,11 +291,7 @@ func (p *OAuth2Provider) ValidateToken(ctx context.Context, oauthConfigID string
 		return false, nil
 	}
 
-	if oauthConfig.TokenID == nil {
-		return false, nil
-	}
-
-	token, err := p.configStore.GetOauthTokenByID(ctx, *oauthConfig.TokenID)
+	token, err := p.configStore.GetSharedOauthTokenByConfigID(ctx, oauthConfigID)
 	if err != nil || token == nil {
 		return false, nil
 	}
@@ -259,28 +313,28 @@ func (p *OAuth2Provider) RevokeToken(ctx context.Context, oauthConfigID string) 
 		return fmt.Errorf("oauth config not found: %w", err)
 	}
 
-	if oauthConfig.TokenID == nil {
-		return fmt.Errorf("no token linked to oauth config")
+	token, err := p.configStore.GetSharedOauthTokenByConfigID(ctx, oauthConfigID)
+	if err != nil {
+		return fmt.Errorf("failed to load oauth token: %w", err)
 	}
-
-	token, err := p.configStore.GetOauthTokenByID(ctx, *oauthConfig.TokenID)
-	if err != nil || token == nil {
-		return fmt.Errorf("oauth token not found: %w", err)
+	if token == nil {
+		return fmt.Errorf("no token linked to oauth config")
 	}
 
 	// Optionally call provider's revocation endpoint (if supported)
 	// This is best-effort - we'll delete the token even if revocation fails
 
-	// Delete token from database
-	if err := p.configStore.DeleteOauthToken(ctx, token.ID); err != nil {
+	// Delete every shared token row for this config, not just the one
+	// GetSharedOauthTokenByConfigID picked above (used only to confirm a
+	// token exists) — nothing guarantees at most one auth_mode='shared' row
+	// per oauth_config_id (see GetSharedOauthTokenByConfigID's doc comment),
+	// and deleting a single row would leave a stale duplicate usable.
+	// oauth_configs itself is left untouched — it's a reusable credential
+	// template (client_id/client_secret/endpoints) independent of any one
+	// token's lifecycle, and no longer carries a token reference or a
+	// revoked-ness of its own to clean up.
+	if err := p.configStore.DeleteSharedOauthTokensByConfigID(ctx, oauthConfigID); err != nil {
 		return fmt.Errorf("failed to delete token: %w", err)
-	}
-
-	// Update oauth_config to remove token reference and mark as revoked
-	oauthConfig.TokenID = nil
-	oauthConfig.Status = "revoked"
-	if err := p.configStore.UpdateOauthConfig(ctx, oauthConfig); err != nil {
-		return fmt.Errorf("failed to update oauth config: %w", err)
 	}
 
 	logger.Debug("OAuth token revoked", "oauth_config_id", oauthConfigID)
@@ -622,9 +676,11 @@ func (p *OAuth2Provider) CompleteOAuthFlow(ctx context.Context, state, code stri
 		return fmt.Errorf("oauth config not found for flow %s", flow.ID)
 	}
 
-	// Check expiry
+	// Check expiry. "failed" (not a since-retired "expired") is the terminal
+	// bootstrap status here — the same value the token-exchange failure branch
+	// below uses for a different kind of bootstrap-attempt failure.
 	if time.Now().After(flow.ExpiresAt) {
-		oauthConfig.Status = "expired"
+		oauthConfig.Status = "failed"
 		p.configStore.UpdateOauthConfig(ctx, oauthConfig)
 		p.cleanupFlow(ctx, flow.ID)
 		return fmt.Errorf("oauth flow expired")
@@ -712,13 +768,25 @@ func (p *OAuth2Provider) CompleteOAuthFlow(ctx context.Context, state, code stri
 		return fmt.Errorf("failed to look up mcp client for oauth config: %w", err)
 	}
 
+	// A shared config can be re-authorized (e.g. via the reauthorize
+	// endpoint) after already having a live token row. Clear any existing
+	// shared rows for this config first so re-completion can't accumulate a
+	// second row alongside the one being created below — best-effort: a
+	// failure here doesn't block issuing the new, working credential, and
+	// RevokeToken's own bulk delete (see DeleteSharedOauthTokensByConfigID)
+	// cleans up any stale row a failed clear here left behind.
+	if err := p.configStore.DeleteSharedOauthTokensByConfigID(ctx, oauthConfig.ID); err != nil {
+		logger.Warn("Failed to clear existing shared oauth tokens before re-completion: oauth_config_id=%s err=%v", oauthConfig.ID, err)
+	}
+
 	if err := p.configStore.CreateOauthToken(ctx, tokenRecord); err != nil {
 		p.cleanupFlow(ctx, flow.ID)
 		return fmt.Errorf("failed to create oauth token: %w", err)
 	}
 
-	// Update oauth_config: link token and set status="authorized"
-	oauthConfig.TokenID = &tokenID
+	// Update oauth_config: set status="authorized". The token row created
+	// above is reachable via (oauth_config_id, auth_mode='shared') — no FK
+	// reference needs pinning here.
 	oauthConfig.Status = "authorized"
 	if err := p.configStore.UpdateOauthConfig(ctx, oauthConfig); err != nil {
 		p.cleanupFlow(ctx, flow.ID)
@@ -851,21 +919,6 @@ func (p *OAuth2Provider) exchangeCodeForTokensWithPKCE(ctx context.Context, toke
 	}
 
 	return p.callTokenEndpoint(ctx, tokenURL, data)
-}
-
-// markExpiredIfPermanent marks oauth_config.status as "expired" when a refresh failure
-// is a permanent auth rejection (PermanentOAuthError). Transient failures are ignored —
-// the TokenRefreshWorker will retry on the next tick.
-func (p *OAuth2Provider) markExpiredIfPermanent(ctx context.Context, oauthConfig *tables.TableOauthConfig, err error) {
-	var permErr *PermanentOAuthError
-	if errors.As(err, &permErr) {
-		oauthConfig.Status = "expired"
-		updateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		if updateErr := p.configStore.UpdateOauthConfig(updateCtx, oauthConfig); updateErr != nil {
-			logger.Error("Failed to update oauth config status: %s, error: %s", oauthConfig.ID, updateErr.Error())
-		}
-	}
 }
 
 // exchangeRefreshToken exchanges refresh token for new access token
@@ -1324,7 +1377,7 @@ func (p *OAuth2Provider) GetUserAccessTokenByMode(ctx context.Context, mode sche
 
 	// Refresh only when known-expired and refresh token exists.
 	if token.ExpiresAt != nil && time.Now().After(*token.ExpiresAt) && strings.TrimSpace(token.RefreshToken) != "" {
-		if err := p.RefreshUserAccessToken(ctx, token.ID); err != nil {
+		if err := p.RefreshAccessToken(ctx, token.ID); err != nil {
 			return "", fmt.Errorf("per-user token expired and refresh failed: %w", err)
 		}
 		token, err = p.configStore.GetOauthUserTokenByMode(ctx, mode, identity, mcpClientID)
@@ -1341,91 +1394,4 @@ func (p *OAuth2Provider) GetUserAccessTokenByMode(ctx context.Context, mode sche
 		return "", fmt.Errorf("per-user access token is empty after sanitization")
 	}
 	return accessToken, nil
-}
-
-// RefreshUserAccessToken refreshes a per-user OAuth access token, looked up
-// by the token row's primary-key ID.
-func (p *OAuth2Provider) RefreshUserAccessToken(ctx context.Context, tokenID string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	token, err := p.configStore.GetOauthUserTokenByID(ctx, tokenID)
-	if err != nil || token == nil {
-		return fmt.Errorf("per-user oauth token not found: %w", err)
-	}
-
-	if token.RefreshToken == "" {
-		return fmt.Errorf("no refresh token available for per-user oauth token")
-	}
-
-	// Load template OAuth config for token_url, client_id, etc. Split nil
-	// from a real lookup failure so a missing config doesn't surface as a
-	// useless "%!w(<nil>)" wrapped error.
-	templateConfig, err := p.configStore.GetOauthConfigByID(ctx, token.OauthConfigID)
-	if err != nil {
-		return fmt.Errorf("failed to load template oauth config for refresh: %w", err)
-	}
-	if templateConfig == nil {
-		return schemas.ErrOAuth2ConfigNotFound
-	}
-
-	// Exchange refresh token
-	newTokenResponse, err := p.exchangeRefreshToken(
-		ctx,
-		templateConfig.TokenURL,
-		templateConfig.GetResolvedClientID(),
-		templateConfig.GetResolvedClientSecret(),
-		token.RefreshToken,
-		strings.TrimSpace(templateConfig.Resource),
-	)
-	if err != nil {
-		// Permanent rejection (HTTP 401, or 400 with invalid_grant /
-		// unauthorized_client per RFC 6749 §5.2) means the refresh token is
-		// dead — revoked, expired, or bound to a grant the AS no longer
-		// honors. Flip the row to 'needs_reauth' and signal re-authentication
-		// via the ErrOAuth2TokenExpired sentinel, which ResolvePerUserOAuthToken
-		// converts into an inline MCPUserOAuthRequiredError with auth URL.
-		// Keeping the row (rather than deleting) preserves binding identity +
-		// audit history; the OAuth callback at re-auth completion upserts
-		// the same row back to 'active' with fresh access/refresh tokens.
-		var permErr *PermanentOAuthError
-		if errors.As(err, &permErr) {
-			// Use context.Background for the terminal status flip — the
-			// caller's ctx may already be canceled (request abort, upstream
-			// timeout) by the time we get the 'invalid_grant' / 401, and if
-			// the UPDATE fails because of that, the row stays 'active' and
-			// every subsequent inference call keeps retrying a dead refresh
-			// token instead of surfacing the re-auth requirement.
-			if markErr := p.configStore.MarkOauthUserTokenNeedsReauthByID(context.Background(), token.ID); markErr != nil {
-				return fmt.Errorf("per-user oauth refresh permanently rejected but status update failed (mcp_client=%s upstream_status=%d): %w",
-					token.MCPClientID, permErr.StatusCode, markErr)
-			}
-			logger.Debug("Per-user OAuth refresh permanently rejected; row marked needs_reauth: mcp_client=%s upstream_status=%d",
-				token.MCPClientID, permErr.StatusCode)
-			return fmt.Errorf("refresh token rejected by upstream OAuth server, re-authentication required: %w", schemas.ErrOAuth2TokenExpired)
-		}
-		// Transient failure (5xx, network blip, non-permanent 400) — keep the
-		// row so the next call retries refresh.
-		return fmt.Errorf("per-user token refresh failed: %w", err)
-	}
-
-	// Update token
-	now := time.Now()
-	token.ExpiresAt = nil
-	if newTokenResponse.ExpiresIn > 0 {
-		exp := now.Add(time.Duration(newTokenResponse.ExpiresIn) * time.Second)
-		token.ExpiresAt = bifrost.Ptr(exp)
-	}
-	token.AccessToken = strings.TrimSpace(newTokenResponse.AccessToken)
-	if newTokenResponse.RefreshToken != "" {
-		token.RefreshToken = strings.TrimSpace(newTokenResponse.RefreshToken)
-	}
-	token.LastRefreshedAt = bifrost.Ptr(now)
-
-	if err := p.configStore.UpdateOauthUserToken(ctx, token); err != nil {
-		return fmt.Errorf("failed to update per-user token after refresh: %w", err)
-	}
-
-	logger.Debug("Per-user OAuth token refreshed: token_id=%s", token.ID)
-	return nil
 }
