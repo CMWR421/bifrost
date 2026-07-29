@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
@@ -48,7 +49,7 @@ func (s *testConfigStore) GetOauthConfigByID(_ context.Context, id string) (*tab
 	return bifrost.Ptr(*cfg), nil
 }
 
-func (s *testConfigStore) UpdateOauthConfig(_ context.Context, cfg *tables.TableOauthConfig) error {
+func (s *testConfigStore) UpdateOauthConfig(_ context.Context, cfg *tables.TableOauthConfig, _ ...*gorm.DB) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.oauthConfigs[cfg.ID] = bifrost.Ptr(*cfg)
@@ -87,6 +88,25 @@ func (s *testConfigStore) UpdateOauthToken(_ context.Context, token *tables.Tabl
 	return nil
 }
 
+// RefreshOauthTokenFieldsIfActive is the test-double equivalent of the real
+// store's status-gated refresh write (see its doc comment on the interface):
+// applies the new credential fields only while the row is still 'active'.
+func (s *testConfigStore) RefreshOauthTokenFieldsIfActive(_ context.Context, id string, accessToken, refreshToken string, expiresAt *time.Time, lastRefreshedAt time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	token, ok := s.oauthTokens[id]
+	if !ok || token.Status != "active" {
+		return false, nil
+	}
+	updated := *token
+	updated.AccessToken = accessToken
+	updated.RefreshToken = refreshToken
+	updated.ExpiresAt = expiresAt
+	updated.LastRefreshedAt = &lastRefreshedAt
+	s.oauthTokens[id] = &updated
+	return true, nil
+}
+
 // MarkOauthUserTokenNeedsReauthByID flips a token's status to 'needs_reauth',
 // the test-double equivalent of the real store's method of the same name —
 // which, despite the historical "UserToken" naming, is not scoped away from
@@ -99,6 +119,19 @@ func (s *testConfigStore) MarkOauthUserTokenNeedsReauthByID(_ context.Context, t
 		return nil
 	}
 	token.Status = "needs_reauth"
+	return nil
+}
+
+// MarkTokensNeedsReauthByConfigID is the test-double equivalent of the real
+// store's bulk, auth_mode-agnostic cascade used by OAuth credential rotation.
+func (s *testConfigStore) MarkTokensNeedsReauthByConfigID(_ context.Context, oauthConfigID string, _ ...*gorm.DB) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, token := range s.oauthTokens {
+		if token.OauthConfigID == oauthConfigID {
+			token.Status = "needs_reauth"
+		}
+	}
 	return nil
 }
 
