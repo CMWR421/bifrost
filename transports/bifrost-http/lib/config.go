@@ -1015,6 +1015,11 @@ func LoadConfig(ctx context.Context, configDirPath string) (*Config, error) {
 	loadWebhooksConfig(ctx, config, &configData)
 	// 8. Governance config
 	loadGovernanceConfig(ctx, config, &configData)
+	// 8a. Semantic complexity classification demands an external vector store
+	// only when one is actually configured (vector store init ran in step 2).
+	if err := validateComplexitySemanticVectorStore(config); err != nil {
+		return nil, err
+	}
 	// 9. Auth config
 	loadAuthConfig(ctx, config, &configData)
 	// 10. Plugins
@@ -3016,6 +3021,26 @@ func complexityAnalyzerConfigFromFile(configData *ConfigData) (*configstore.Comp
 	}
 	fileConfig.ConfigHashes = fileHashes
 	return fileConfig, fileHashes, true
+}
+
+// validateComplexitySemanticVectorStore fails startup when the semantic
+// complexity classifier requires an external vector store but none is
+// configured, instead of silently classifying with the fallback forever.
+func validateComplexitySemanticVectorStore(config *Config) error {
+	if config == nil || config.GovernanceConfig == nil || config.GovernanceConfig.ComplexityAnalyzerConfig == nil {
+		return nil
+	}
+	semantic := config.GovernanceConfig.ComplexityAnalyzerConfig.Semantic
+	if semantic == nil || semantic.VectorStore != configstore.ComplexitySemanticVectorStoreExternal {
+		return nil
+	}
+	if config.VectorStore == nil {
+		return fmt.Errorf("governance.complexity_analyzer_config.semantic.vector_store is %q but no vector store is configured; add a vector_store section to config.json or set it to %q or %q",
+			configstore.ComplexitySemanticVectorStoreExternal,
+			configstore.ComplexitySemanticVectorStoreAuto,
+			configstore.ComplexitySemanticVectorStoreEmbedded)
+	}
+	return nil
 }
 
 // mergeComplexityAnalyzerConfigFromFile uses defaults as the first split-mode
