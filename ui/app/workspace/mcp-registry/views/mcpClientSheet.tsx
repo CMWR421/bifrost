@@ -126,7 +126,9 @@ export default function MCPClientSheet({
 		null,
 	);
 	// Drives the MCPHeadersAuthorizer dialog for a config.json-bootstrapped
-	// per_user_headers client sitting in pending_verification.
+	// per_user_headers client sitting in pending_verification. Repairing an
+	// already-verified client's admin credential is handled from the table's
+	// row-actions menu (mirrors the per_user_oauth "Refresh admin credential" flow).
 	const [bootstrapHeadersOpen, setBootstrapHeadersOpen] = useState(false);
 
 	const { toast } = useToast();
@@ -268,19 +270,19 @@ export default function MCPClientSheet({
 			allowed_extra_headers: mcpClient.config.allowed_extra_headers || [],
 			oauth_config: supportsOAuthCredentialUpdate
 				? {
-						client_id: mcpClient.config.oauth_client_id,
-						client_secret: mcpClient.config.oauth_client_secret,
-						authorize_url: mcpClient.config.oauth_authorize_url,
-						token_url: mcpClient.config.oauth_token_url,
-						registration_url: mcpClient.config.oauth_registration_url,
-						resource: mcpClient.config.oauth_resource,
-					}
+					client_id: mcpClient.config.oauth_client_id,
+					client_secret: mcpClient.config.oauth_client_secret,
+					authorize_url: mcpClient.config.oauth_authorize_url,
+					token_url: mcpClient.config.oauth_token_url,
+					registration_url: mcpClient.config.oauth_registration_url,
+					resource: mcpClient.config.oauth_resource,
+				}
 				: undefined,
 			tls_config: mcpClient.config.tls_config
 				? {
-						insecure_skip_verify: mcpClient.config.tls_config.insecure_skip_verify,
-						ca_cert_pem: mcpClient.config.tls_config.ca_cert_pem,
-					}
+					insecure_skip_verify: mcpClient.config.tls_config.insecure_skip_verify,
+					ca_cert_pem: mcpClient.config.tls_config.ca_cert_pem,
+				}
 				: undefined,
 		},
 	});
@@ -304,19 +306,19 @@ export default function MCPClientSheet({
 			allowed_extra_headers: mcpClient.config.allowed_extra_headers || [],
 			oauth_config: supportsOAuthCredentialUpdate
 				? {
-						client_id: mcpClient.config.oauth_client_id,
-						client_secret: mcpClient.config.oauth_client_secret,
-						authorize_url: mcpClient.config.oauth_authorize_url,
-						token_url: mcpClient.config.oauth_token_url,
-						registration_url: mcpClient.config.oauth_registration_url,
-						resource: mcpClient.config.oauth_resource,
-					}
+					client_id: mcpClient.config.oauth_client_id,
+					client_secret: mcpClient.config.oauth_client_secret,
+					authorize_url: mcpClient.config.oauth_authorize_url,
+					token_url: mcpClient.config.oauth_token_url,
+					registration_url: mcpClient.config.oauth_registration_url,
+					resource: mcpClient.config.oauth_resource,
+				}
 				: undefined,
 			tls_config: mcpClient.config.tls_config
 				? {
-						insecure_skip_verify: mcpClient.config.tls_config.insecure_skip_verify,
-						ca_cert_pem: mcpClient.config.tls_config.ca_cert_pem,
-					}
+					insecure_skip_verify: mcpClient.config.tls_config.insecure_skip_verify,
+					ca_cert_pem: mcpClient.config.tls_config.ca_cert_pem,
+				}
 				: undefined,
 		});
 	}, [form, mcpClient, supportsOAuthCredentialUpdate]);
@@ -406,21 +408,21 @@ export default function MCPClientSheet({
 					allowed_extra_headers: data.allowed_extra_headers,
 					oauth_config: shouldRotateOAuthCredentials
 						? {
-								client_id: oauthClientID,
-								client_secret: oauthClientSecret,
-								authorize_url: data.oauth_config?.authorize_url || undefined,
-								token_url: data.oauth_config?.token_url || undefined,
-								registration_url: data.oauth_config?.registration_url || undefined,
-								scopes: oauthScopes,
-								resource: data.oauth_config?.resource || undefined,
-							}
+							client_id: oauthClientID,
+							client_secret: oauthClientSecret,
+							authorize_url: data.oauth_config?.authorize_url || undefined,
+							token_url: data.oauth_config?.token_url || undefined,
+							registration_url: data.oauth_config?.registration_url || undefined,
+							scopes: oauthScopes,
+							resource: data.oauth_config?.resource || undefined,
+						}
 						: undefined,
 					tls_config:
 						data.tls_config !== undefined
 							? {
-									insecure_skip_verify: data.tls_config.insecure_skip_verify ?? false,
-									ca_cert_pem: data.tls_config.ca_cert_pem,
-								}
+								insecure_skip_verify: data.tls_config.insecure_skip_verify ?? false,
+								ca_cert_pem: data.tls_config.ca_cert_pem,
+							}
 							: undefined,
 					vk_configs: vkConfigsDirty ? vkConfigs : undefined,
 				},
@@ -556,15 +558,23 @@ export default function MCPClientSheet({
 									{isPerUserAuth ? (
 										// Per-user clients never hold a shared upstream connection, so a
 										// connection-state badge here would be misleading: point to the
-										// per-user sessions this client actually has instead.
-										<Link
-											to="/workspace/mcp-sessions"
-											search={{ mcp_client_id: [mcpClient.config.client_id] }}
-											className="text-primary text-xs font-medium hover:underline"
-											data-testid="mcp-client-view-sessions-link"
-										>
-											View sessions
-										</Link>
+										// per-user sessions this client actually has instead. The one
+										// exception is needs_reauth, which for per-user clients means the
+										// retained admin discovery credential needs repair: surface that
+										// badge next to the link so the admin can act on it.
+										<>
+											<Link
+												to="/workspace/mcp-sessions"
+												search={{ mcp_client_id: [mcpClient.config.client_id] }}
+												className="text-primary text-xs font-medium hover:underline"
+												data-testid="mcp-client-view-sessions-link"
+											>
+												View sessions
+											</Link>
+											{mcpClient.state === "needs_reauth" && (
+												<Badge className={MCP_STATUS_COLORS[mcpClient.state]}>{mcpClient.state}</Badge>
+											)}
+										</>
 									) : (
 										<Badge className={MCP_STATUS_COLORS[mcpClient.state]}>{mcpClient.state}</Badge>
 									)}
@@ -587,7 +597,9 @@ export default function MCPClientSheet({
 											? "This client was declared in config.json. An admin sign-in is needed to verify the OAuth setup and discover tools; Bifrost keeps it on file to refresh the tool list periodically. Each user will still authenticate individually when they use this server."
 											: "This client was declared in config.json and needs a one-time OAuth authorization before it can be used."
 										: mcpClient.state === "needs_reauth"
-											? "This connection's credentials need to be re-authorized. Click Reauthorize to redo the OAuth consent flow."
+											? isPerUserAuth
+												? "The admin credential Bifrost keeps on file to refresh this server's tool list needs repair. End-user credentials and tool calls are unaffected. Use Refresh admin credential from the server's actions menu to fix it."
+												: "This connection's credentials need to be re-authorized. Use Reauthorize from the server's actions menu to redo the OAuth consent flow."
 											: "MCP server configuration and available tools"}
 								</SheetDescription>
 							</div>
@@ -655,7 +667,7 @@ export default function MCPClientSheet({
 											<span className="font-mono break-all">
 												{mcpClient.config.connection_type === "stdio"
 													? `${mcpClient.config.stdio_config?.command ?? ""} ${(mcpClient.config.stdio_config?.args ?? []).join(" ")}`.trim() ||
-														"-"
+													"-"
 													: mcpClient.config.connection_string?.type === "env" || mcpClient.config.connection_string?.type === "vault"
 														? mcpClient.config.connection_string.ref
 														: mcpClient.config.connection_string?.value || "-"}
@@ -674,7 +686,7 @@ export default function MCPClientSheet({
 															return [name, valueParts.join("=")];
 														}),
 													)}
-													onChange={() => {}}
+													onChange={() => { }}
 													fixedKeys={mcpClient.config.stdio_config.envs.map((env) => env.split("=")[0])}
 													valuePlaceholder="—"
 													label=""
@@ -1069,9 +1081,9 @@ export default function MCPClientSheet({
 														onBlur={() => {
 															const parsed = allowedExtraHeadersRaw.trim()
 																? allowedExtraHeadersRaw
-																		.split(",")
-																		.map((h) => h.trim())
-																		.filter(Boolean)
+																	.split(",")
+																	.map((h) => h.trim())
+																	.filter(Boolean)
 																: [];
 															field.onChange(parsed);
 															field.onBlur();
@@ -1705,8 +1717,9 @@ export default function MCPClientSheet({
 							/* error state rendered by the dialog itself */
 						}}
 						onConflict={(error) => {
-							// 409: tools were already discovered (e.g. double submit or a
-							// concurrent verification) — the client is verified; refresh.
+							// 409: the server refused to re-run discovery; tools were
+							// already discovered (double submit / concurrent
+							// verification) — either way the client is fine, so refresh.
 							toast({ title: "Already verified", description: error });
 							setBootstrapHeadersOpen(false);
 							onSubmitSuccess();
