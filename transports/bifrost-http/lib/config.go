@@ -1854,6 +1854,16 @@ func pinMCPClientImmutableFields(fileClient, existing *schemas.MCPClientConfig) 
 		fileClient.PerUserHeaderKeys = existing.PerUserHeaderKeys
 	}
 
+	// Same rule for the token_exchange scoping block: audience/scopes edits
+	// apply (the update API accepts them too), but a token_exchange client
+	// must keep a block with a non-empty audience.
+	if fileClient.AuthType == schemas.MCPAuthTypeTokenExchange &&
+		(fileClient.TokenExchange == nil || strings.TrimSpace(fileClient.TokenExchange.Audience) == "") &&
+		existing.TokenExchange != nil {
+		logger.Warn("token_exchange cannot be emptied for MCP client %q (auth_type 'token_exchange'); keeping the stored block", existing.Name)
+		fileClient.TokenExchange = existing.TokenExchange
+	}
+
 	fileClient.OauthConfigID = existing.OauthConfigID
 	if len(fileClient.DiscoveredTools) == 0 {
 		fileClient.DiscoveredTools = existing.DiscoveredTools
@@ -1991,6 +2001,7 @@ func applyMCPClientPinnedStateToRow(row *configstoreTables.TableMCPClient, clien
 	row.ConnectionString = clientConfig.ConnectionString
 	row.StdioConfig = clientConfig.StdioConfig
 	row.PerUserHeaderKeys = mcputils.CanonicalizeHeaderKeys(clientConfig.PerUserHeaderKeys)
+	row.TokenExchange = clientConfig.TokenExchange
 	row.OauthConfigID = clientConfig.OauthConfigID
 	row.DiscoveredTools = clientConfig.DiscoveredTools
 	row.DiscoveredToolNameMapping = clientConfig.DiscoveredToolNameMapping
@@ -2175,6 +2186,7 @@ func mcpClientConfigToTable(clientConfig *schemas.MCPClientConfig) (configstoreT
 		DiscoveredTools:           clientConfig.DiscoveredTools,
 		DiscoveredToolNameMapping: clientConfig.DiscoveredToolNameMapping,
 		PerUserHeaderKeys:         mcputils.CanonicalizeHeaderKeys(clientConfig.PerUserHeaderKeys),
+		TokenExchange:             clientConfig.TokenExchange,
 		PendingOAuthConfig:        clientConfig.PendingOAuthConfig,
 		ConfigHash:                clientConfig.ConfigHash,
 	}, nil
@@ -6510,6 +6522,7 @@ func (c *Config) UpdateMCPClient(ctx context.Context, id string, updatedConfig *
 	c.MCPConfig.ClientConfigs[configIndex].AllowOnAllVirtualKeys = updatedConfig.AllowOnAllVirtualKeys
 	c.MCPConfig.ClientConfigs[configIndex].Disabled = updatedConfig.Disabled
 	c.MCPConfig.ClientConfigs[configIndex].PerUserHeaderKeys = updatedConfig.PerUserHeaderKeys
+	c.MCPConfig.ClientConfigs[configIndex].TokenExchange = updatedConfig.TokenExchange
 
 	// Handle disable/enable lifecycle when the Disabled flag toggles and the client
 	// is registered at runtime. We call the core bifrost methods directly (not the
@@ -6728,6 +6741,17 @@ func (c *Config) RedactMCPClientConfig(config *schemas.MCPClientConfig) *schemas
 	}
 	if config.OauthClientSecret != nil {
 		configCopy.OauthClientSecret = config.OauthClientSecret.Redacted()
+	}
+
+	// Redact the token-exchange application credentials. Copy the struct
+	// first — configCopy shares the pointer with the live config, and
+	// Redacted() returns a fresh SecretVar so the live block is never
+	// mutated.
+	if config.TokenExchange != nil {
+		exchangeCopy := *config.TokenExchange
+		exchangeCopy.ClientID = exchangeCopy.ClientID.Redacted()
+		exchangeCopy.ClientSecret = exchangeCopy.ClientSecret.Redacted()
+		configCopy.TokenExchange = &exchangeCopy
 	}
 
 	// Redact credentials inside the inline `oauth_config` bootstrap block.

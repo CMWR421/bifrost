@@ -511,15 +511,18 @@ type ConfigStore interface {
 	// needs to reach the row regardless of status to delete it. Returns
 	// (nil, nil) when no shared token exists for this config.
 	GetSharedOauthTokenByConfigID(ctx context.Context, oauthConfigID string) (*tables.TableMCPOauthToken, error)
-	// GetAdminOauthTokenByConfigID is GetSharedOauthTokenByConfigID's
+	// GetAdminOauthTokenByMCPClientID is GetSharedOauthTokenByConfigID's
 	// admin-mode counterpart — resolves the retained bootstrap-verification
-	// token for a per_user_oauth client's periodic tool-discovery refresh.
-	GetAdminOauthTokenByConfigID(ctx context.Context, oauthConfigID string) (*tables.TableMCPOauthToken, error)
-	// GetAdminOauthTokensByConfigIDs is GetAdminOauthTokenByConfigID's batch
-	// counterpart: resolves the retained admin-mode token row for each of the
-	// given oauth_config_ids in one query, keyed by OauthConfigID. Not
-	// filtered by status; configs with no admin row are absent from the map.
-	GetAdminOauthTokensByConfigIDs(ctx context.Context, oauthConfigIDs []string) (map[string]*tables.TableMCPOauthToken, error)
+	// token for a per-user client's periodic tool-discovery refresh. Keyed
+	// by mcp_client_id because every admin row carries it, whether or not
+	// the credential has an oauth_configs template behind it. Not filtered
+	// by status. Returns (nil, nil) when no admin row exists.
+	GetAdminOauthTokenByMCPClientID(ctx context.Context, mcpClientID string) (*tables.TableMCPOauthToken, error)
+	// GetAdminOauthTokensByMCPClientIDs is GetAdminOauthTokenByMCPClientID's
+	// batch counterpart: resolves the retained admin-mode token row for each
+	// of the given MCP client IDs in one query, keyed by MCPClientID. Not
+	// filtered by status; clients with no admin row are absent from the map.
+	GetAdminOauthTokensByMCPClientIDs(ctx context.Context, mcpClientIDs []string) (map[string]*tables.TableMCPOauthToken, error)
 	// PromoteSharedOauthTokenToAdmin transactionally installs the config's
 	// fresh shared-mode token as the retained admin-mode discovery credential
 	// for mcpClientID: if an admin row already exists its credential fields
