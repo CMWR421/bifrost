@@ -37,6 +37,7 @@ import {
 	useInitiateMCPClientVerificationMutation,
 	useUpdateMCPClientMutation,
 	useVerifyMCPClientHeadersMutation,
+	useVerifyMCPClientExchangeMutation,
 } from "@/lib/store";
 import { MCPClient, MCPVKConfig } from "@/lib/types/mcp";
 import { mcpClientUpdateSchema, type MCPClientUpdateSchema } from "@/lib/types/schemas";
@@ -112,13 +113,21 @@ export default function MCPClientSheet({
 	hasNext = false,
 }: MCPClientSheetProps) {
 	const hasUpdateMCPClientAccess = useRbac(RbacResource.MCPGateway, RbacOperation.Update);
-	// Per-user auth types (OAuth + headers) don't hold a shared upstream
-	// connection, so the connection-state badge is misleading for them: see
-	// the state badge below.
-	const isPerUserAuth = mcpClient.config.auth_type === "per_user_oauth" || mcpClient.config.auth_type === "per_user_headers";
+	// Per-user auth types (OAuth, headers, token exchange) don't hold a shared
+	// upstream connection, so the connection-state badge is misleading for
+	// them: see the state badge below.
+	const isPerUserAuth =
+		mcpClient.config.auth_type === "per_user_oauth" ||
+		mcpClient.config.auth_type === "per_user_headers" ||
+		mcpClient.config.auth_type === "token_exchange";
+	// Token-exchange clients hold no per-user session rows (exchanged tokens
+	// are never persisted), so the sessions link only applies to the other
+	// two per-user types.
+	const hasPerUserSessions = mcpClient.config.auth_type === "per_user_oauth" || mcpClient.config.auth_type === "per_user_headers";
 	const [updateMCPClient, { isLoading: isUpdating }] = useUpdateMCPClientMutation();
 	const [initiateVerification, { isLoading: isInitiatingVerification }] = useInitiateMCPClientVerificationMutation();
 	const [verifyMCPClientHeaders] = useVerifyMCPClientHeadersMutation();
+	const [verifyMCPClientExchange, { isLoading: isVerifyingExchange }] = useVerifyMCPClientExchangeMutation();
 
 	// Drives the OAuth2Authorizer dialog for a config.json-bootstrapped OAuth
 	// client sitting in pending_verification.
@@ -133,11 +142,28 @@ export default function MCPClientSheet({
 
 	const { toast } = useToast();
 
+	// Verify (or repair) a token_exchange client. Synchronous and inputless:
+	// the backend exchanges the signed-in admin's own identity token, so
+	// there is nothing to collect — no dialog, no sample values.
+	const handleVerifyExchange = useCallback(async () => {
+		try {
+			const response = await verifyMCPClientExchange(mcpClient.config.client_id).unwrap();
+			toast({ title: "Verified", description: response.message });
+		} catch (error) {
+			toast({ title: "Verification failed", description: getErrorMessage(error), variant: "destructive" });
+		}
+	}, [verifyMCPClientExchange, mcpClient.config.client_id, toast]);
+
 	const handleStartBootstrap = useCallback(async () => {
-		// per_user_headers takes a synchronous form-based path; OAuth-based
-		// types kick off the existing browser flow.
+		// per_user_headers takes a synchronous form-based path, token_exchange
+		// a synchronous inputless one; OAuth-based types kick off the existing
+		// browser flow.
 		if (mcpClient.config.auth_type === "per_user_headers") {
 			setBootstrapHeadersOpen(true);
+			return;
+		}
+		if (mcpClient.config.auth_type === "token_exchange") {
+			await handleVerifyExchange();
 			return;
 		}
 		try {
@@ -555,7 +581,7 @@ export default function MCPClientSheet({
 							<div className="space-y-2">
 								<SheetTitle className="flex w-fit items-center gap-2 font-medium">
 									{mcpClient.config.name}
-									{isPerUserAuth ? (
+									{isPerUserAuth && hasPerUserSessions ? (
 										// Per-user clients never hold a shared upstream connection, so a
 										// connection-state badge here would be misleading: point to the
 										// per-user sessions this client actually has instead. The one
@@ -575,6 +601,11 @@ export default function MCPClientSheet({
 												<Badge className={MCP_STATUS_COLORS[mcpClient.state]}>{mcpClient.state}</Badge>
 											)}
 										</>
+									) : isPerUserAuth ? (
+										// Token exchange: no stored sessions to link to; surface only the
+										// actionable states (repair / bootstrap) instead of a live
+										// connection badge that per-call clients don't have.
+										mcpClient.state === "needs_reauth" && <Badge className={MCP_STATUS_COLORS[mcpClient.state]}>{mcpClient.state}</Badge>
 									) : (
 										<Badge className={MCP_STATUS_COLORS[mcpClient.state]}>{mcpClient.state}</Badge>
 									)}
@@ -583,7 +614,7 @@ export default function MCPClientSheet({
 											type="button"
 											size="sm"
 											variant="default"
-											disabled={isInitiatingVerification}
+											disabled={isInitiatingVerification || isVerifyingExchange}
 											onClick={handleStartBootstrap}
 											data-testid="mcp-authorize-bootstrap-btn"
 										>
@@ -593,9 +624,11 @@ export default function MCPClientSheet({
 								</SheetTitle>
 								<SheetDescription>
 									{mcpClient.state === "pending_verification"
-										? mcpClient.config.auth_type === "per_user_oauth"
-											? "This client was declared in config.json. An admin sign-in is needed to verify the OAuth setup and discover tools; Bifrost keeps it on file to refresh the tool list periodically. Each user will still authenticate individually when they use this server."
-											: "This client was declared in config.json and needs a one-time OAuth authorization before it can be used."
+										? mcpClient.config.auth_type === "token_exchange"
+											? "This server needs a one-time verification: Bifrost exchanges your signed-in identity token, tests the connection, and discovers tools. Callers then have their own identity tokens exchanged automatically on every tool call."
+											: mcpClient.config.auth_type === "per_user_oauth"
+												? "This client was declared in config.json. An admin sign-in is needed to verify the OAuth setup and discover tools; Bifrost keeps it on file to refresh the tool list periodically. Each user will still authenticate individually when they use this server."
+												: "This client was declared in config.json and needs a one-time OAuth authorization before it can be used."
 										: mcpClient.state === "needs_reauth"
 											? isPerUserAuth
 												? "The admin credential Bifrost keeps on file to refresh this server's tool list needs repair. End-user credentials and tool calls are unaffected. Use Refresh admin credential from the server's actions menu to fix it."

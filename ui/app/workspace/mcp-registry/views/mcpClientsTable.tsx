@@ -24,6 +24,7 @@ import {
 	useReauthorizeMCPClientMutation,
 	useReconnectMCPClientMutation,
 	useUpdateMCPClientMutation,
+	useVerifyMCPClientExchangeMutation,
 	useVerifyMCPClientHeadersMutation,
 } from "@/lib/store";
 import { MCPClient } from "@/lib/types/mcp";
@@ -56,11 +57,13 @@ function MCPClientActionsMenu({
 	hasDeleteAccess,
 	isReconnecting,
 	isReauthorizing,
+	isVerifyingExchange,
 	isPerUserAuth,
 	onEdit,
 	onReconnect,
 	onReauthorize,
 	onRefreshHeaders,
+	onVerifyExchange,
 	onDelete,
 }: {
 	client: MCPClient;
@@ -68,11 +71,13 @@ function MCPClientActionsMenu({
 	hasDeleteAccess: boolean;
 	isReconnecting: boolean;
 	isReauthorizing: boolean;
+	isVerifyingExchange: boolean;
 	isPerUserAuth: boolean;
 	onEdit: (client: MCPClient) => void;
 	onReconnect: (client: MCPClient) => void;
 	onReauthorize: (client: MCPClient) => void;
 	onRefreshHeaders: (client: MCPClient) => void;
+	onVerifyExchange: (client: MCPClient) => void;
 	onDelete: (client: MCPClient) => void;
 }) {
 	const [isOpen, setIsOpen] = useState(false);
@@ -170,6 +175,24 @@ function MCPClientActionsMenu({
 							Refresh admin credential
 						</DropdownMenuItem>
 					)}
+				{hasUpdateAccess &&
+					client.state !== "pending_verification" &&
+					client.state !== "disabled" &&
+					client.config.auth_type === "token_exchange" && (
+						<DropdownMenuItem
+							className="cursor-pointer"
+							disabled={isVerifyingExchange}
+							data-testid={`mcp-client-verify-exchange-${client.config.client_id}-menu-item`}
+							onSelect={(e) => {
+								e.preventDefault();
+								onVerifyExchange(client);
+								setIsOpen(false);
+							}}
+						>
+							<KeyRound className="h-4 w-4" />
+							Re-verify as me
+						</DropdownMenuItem>
+					)}
 				{hasDeleteAccess && (
 					<DropdownMenuItem
 						variant="destructive"
@@ -230,6 +253,7 @@ export default function MCPClientsTable({
 
 	const [reconnectingClients, setReconnectingClients] = useState<string[]>([]);
 	const [reauthorizingClients, setReauthorizingClients] = useState<string[]>([]);
+	const [verifyingExchangeClients, setVerifyingExchangeClients] = useState<string[]>([]);
 	const [togglingClientIds, setTogglingClientIds] = useState<Set<string>>(new Set());
 	// Drives the OAuth2Authorizer dialog for a client redoing consent via
 	// POST /reauthorize, triggered from the row actions menu.
@@ -250,6 +274,7 @@ export default function MCPClientsTable({
 	// RTK Query mutations
 	const [reconnectMCPClient] = useReconnectMCPClientMutation();
 	const [reauthorizeMCPClient] = useReauthorizeMCPClientMutation();
+	const [verifyMCPClientExchange] = useVerifyMCPClientExchangeMutation();
 	const [verifyMCPClientHeaders] = useVerifyMCPClientHeadersMutation();
 	const [deleteMCPClient] = useDeleteMCPClientMutation();
 	const [updateMCPClient] = useUpdateMCPClientMutation();
@@ -309,6 +334,24 @@ export default function MCPClientsTable({
 		});
 	};
 
+	// Verify (or repair) a token_exchange client. Synchronous and inputless:
+	// the backend exchanges the signed-in admin's own identity token, so
+	// there is nothing to collect — no dialog, no sample values.
+	const handleVerifyExchange = async (client: MCPClient) => {
+		try {
+			setVerifyingExchangeClients((prev) => [...prev, client.config.client_id]);
+			const response = await verifyMCPClientExchange(client.config.client_id).unwrap();
+			toast({ title: "Verified", description: response.message });
+			if (refetch) {
+				await refetch();
+			}
+		} catch (error) {
+			toast({ title: "Verification failed", description: getErrorMessage(error), variant: "destructive" });
+		} finally {
+			setVerifyingExchangeClients((prev) => prev.filter((id) => id !== client.config.client_id));
+		}
+	};
+
 	const handleDelete = async (client: MCPClient) => {
 		try {
 			await deleteMCPClient(client.config.client_id).unwrap();
@@ -353,6 +396,8 @@ export default function MCPClientsTable({
 			case "oauth":
 			case "per_user_oauth":
 				return "OAuth";
+			case "token_exchange":
+				return "Token Exchange";
 			default:
 				return type;
 		}
@@ -362,6 +407,7 @@ export default function MCPClientsTable({
 		switch (type) {
 			case "per_user_oauth":
 			case "per_user_headers":
+			case "token_exchange":
 				return "Per-User";
 			case "oauth":
 			case "headers":
@@ -547,7 +593,15 @@ export default function MCPClientsTable({
 									// Per-user auth types (OAuth + headers) don't hold a shared
 									// upstream connection, so reconnect is a no-op for them — the
 									// backend's ReconnectClient rejects with ErrMCPReconnectNotApplicable.
-									const isPerUserAuth = c.config.auth_type === "per_user_oauth" || c.config.auth_type === "per_user_headers";
+									const isPerUserAuth =
+										c.config.auth_type === "per_user_oauth" ||
+										c.config.auth_type === "per_user_headers" ||
+										c.config.auth_type === "token_exchange";
+									// Token-exchange clients hold no per-user session rows (nothing
+									// to view), unlike per_user_oauth/per_user_headers — mirrors
+									// mcpClientSheet.tsx's hasPerUserSessions.
+									const hasPerUserSessions =
+										c.config.auth_type === "per_user_oauth" || c.config.auth_type === "per_user_headers";
 									const enabledToolsCount =
 										c.state == "connected"
 											? c.config.tools_to_execute?.includes("*")
@@ -609,7 +663,7 @@ export default function MCPClientsTable({
 												)}
 											</TableCell>
 											<TableCell onClick={(e) => e.stopPropagation()}>
-												{isPerUserAuth ? (
+												{isPerUserAuth && hasPerUserSessions ? (
 													// Per-user clients never hold a shared upstream connection, so a
 													// connection-state badge here would be misleading: point to the
 													// per-user sessions this client actually has instead. The one
@@ -627,6 +681,11 @@ export default function MCPClientsTable({
 														</Link>
 														{c.state === "needs_reauth" && <Badge className={MCP_STATUS_COLORS[c.state]}>{c.state}</Badge>}
 													</span>
+												) : isPerUserAuth ? (
+													// Token exchange: no stored sessions to link to; surface only the
+													// actionable states (repair / bootstrap) instead of a live
+													// connection badge that per-call clients don't have.
+													c.state === "needs_reauth" && <Badge className={MCP_STATUS_COLORS[c.state]}>{c.state}</Badge>
 												) : (
 													<Badge className={MCP_STATUS_COLORS[c.state]}>{c.state}</Badge>
 												)}
@@ -677,11 +736,13 @@ export default function MCPClientsTable({
 													hasDeleteAccess={hasDeleteMCPClientAccess}
 													isReconnecting={reconnectingClients.includes(c.config.client_id)}
 													isReauthorizing={reauthorizingClients.includes(c.config.client_id)}
+													isVerifyingExchange={verifyingExchangeClients.includes(c.config.client_id)}
 													isPerUserAuth={isPerUserAuth}
 													onEdit={handleRowClick}
 													onReconnect={(client) => void handleReconnect(client)}
 													onReauthorize={(client) => void handleReauthorize(client)}
 													onRefreshHeaders={handleRefreshHeaders}
+													onVerifyExchange={(client) => void handleVerifyExchange(client)}
 													onDelete={setClientToDelete}
 												/>
 											</TableCell>
