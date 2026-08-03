@@ -431,6 +431,17 @@ export const logsApi = baseApi.injectEndpoints({
 			}),
 		}),
 
+		// Stop a running cost recalculation. Costs already recomputed are kept; the job
+		// simply stops walking the window. Omit id to cancel whichever job is in flight.
+		// Resolves with the job's post-cancel status so the caller can settle its UI.
+		cancelRecalculateCostJob: builder.mutation<RecalcJobStatus, { id?: string } | void>({
+			query: (arg) => ({
+				url: "/logs/recalculate-cost/cancel",
+				method: "POST",
+				params: arg?.id ? { id: arg.id } : {},
+			}),
+		}),
+
 		// Get a single log entry by ID (includes raw_request and raw_response)
 		getLogById: builder.query<LogEntry, string>({
 			query: (id) => `/logs/${encodeURIComponent(id)}`,
@@ -477,6 +488,7 @@ export const {
 	useDeleteLogsMutation,
 	useRecalculateLogCostsMutation,
 	useGetRecalculateCostStatusQuery,
+	useCancelRecalculateCostJobMutation,
 	useLazyGetLogByIdQuery,
 	useGetLogByIdQuery,
 } = logsApi;
